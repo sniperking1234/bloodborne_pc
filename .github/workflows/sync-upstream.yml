@@ -1,0 +1,117 @@
+name: Sync upstream branches
+
+on:
+  schedule:
+    - cron: "30 18 * * *"   # 每天 UTC 18:30（北京时间次日凌晨 2:30）运行
+  workflow_dispatch: {}      # 也支持在 Actions 页面手动触发
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # 防止这个文件哪天被合并进上游后、在上游仓库里误跑
+    if: github.repository_owner != 'Supermedo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # 关键：用带 Workflows 写权限的 PAT 检出并推送。
+      # Actions 内置的 GITHUB_TOKEN 是 GitHub App token，GitHub 安全策略禁止它
+      # 推送任何会创建/修改 .github/workflows/ 的提交——而下方"放回"步骤每次
+      # 都会产生这样的提交，所以必须用 secret SYNC_TOKEN。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 必须拉全量历史，否则推送不了
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      # windows（默认分支）会被镜像成上游版本，这个文件自己会"消失"，所以先备份
+      - name: Back up this workflow file
+        run: cp .github/workflows/sync-upstream.yml "$RUNNER_TEMP/sync.yml"
+
+      - name: Fetch upstream
+        run: |
+          git remote -v | grep -q upstream || \
+            git remote add upstream https://github.com/Supermedo/bloodborne_pc.git
+          git fetch --prune upstream
+          # fetch 会创建 refs/remotes/upstream/HEAD 符号引用，它会被下面的通配符
+          # 匹配到、在 fork 上生成一个叫 HEAD 的垃圾分支；push 命令行上的负向
+          # refspec 挡不住它，所以推送前直接删掉这个 symref
+          git remote set-head upstream --delete
+
+      - name: Mirror all upstream branches into this fork
+        run: git push --force origin 'refs/remotes/upstream/*:refs/heads/*'
+
+      # 同步所有 tag（windows-v1.0 ~ windows-v1.9.4 等 release 标签）。
+      # 注意：只加不删——上游删掉的 tag 会留在 fork 上（tag 很少被删，一般无影响）
+      - name: Mirror all upstream tags into this fork
+        run: |
+          git fetch --tags upstream
+          git push --force origin --tags
+
+      # 镜像上游 release（说明文字 + 二进制附件，Bloodborne-Windows.zip 每个
+      # 80~190 MB）到本 fork。
+      # 只做增量：已存在的 release 不重建，仅补缺失资产、同步更新的正文。
+      # 首次运行要搬运 ~2.8 GB 附件（15 分钟级），之后每次基本秒过。
+      # 双 token：读上游用内置 GITHUB_TOKEN（公开仓库只读没问题，但无写权限），
+      # 写 fork 用 SYNC_TOKEN（细粒度 PAT，Contents 写权限）。
+      - name: Mirror upstream releases into this fork
+        env:
+          UP_TOKEN: ${{ github.token }}          # 只读上游（公开仓库）
+          FORK_TOKEN: ${{ secrets.SYNC_TOKEN }}   # 写入本 fork
+        run: |
+          UPSTREAM=Supermedo/bloodborne_pc
+          FORK="$GITHUB_REPOSITORY"
+          DIR="$RUNNER_TEMP/relmirror"
+          mkdir -p "$DIR"
+
+          up()   { GH_TOKEN="$UP_TOKEN"   gh "$@" --repo "$UPSTREAM"; }
+          mine() { GH_TOKEN="$FORK_TOKEN" gh "$@" --repo "$FORK"; }
+
+          # 上游 release 的 tag，从旧到新（fork 上 Latest 徽章落在最新版）
+          mapfile -t tags < <(up release list --limit 100 --json tagName --jq '.[].tagName' | tac)
+
+          for tag in "${tags[@]}"; do
+            echo "== release $tag"
+            fork_json=$(mine release view "$tag" --json body,assets 2>/dev/null || true)
+            if [[ -z "$fork_json" ]]; then
+              name=$(up release view "$tag" --json name --jq .name)
+              is_pre=$(up release view "$tag" --json isPrerelease --jq .isPrerelease)
+              up release view "$tag" --json body --jq .body > "$DIR/body.md"
+              args=(--title "$name" --notes-file "$DIR/body.md" --verify-tag)
+              [[ "$is_pre" == "true" ]] && args+=(--prerelease)
+              mine release create "$tag" "${args[@]}"
+              fork_json=$(mine release view "$tag" --json body,assets)
+            else
+              # 正文与上游不同则更新
+              up release view "$tag" --json body --jq .body > "$DIR/body.md"
+              if [[ "$(jq -r .body <<<"$fork_json")" != "$(cat "$DIR/body.md")" ]]; then
+                mine release edit "$tag" --notes-file "$DIR/body.md" >/dev/null
+              fi
+            fi
+
+            # 补缺失的资产
+            mapfile -t have < <(jq -r '.assets[].name' <<<"$fork_json")
+            for a in $(up release view "$tag" --json assets --jq '.assets[].name'); do
+              if printf '%s\n' "${have[@]}" | grep -qx "$a"; then continue; fi
+              echo "  asset $tag/$a：下载并上传"
+              up release download "$tag" --pattern "$a" --dir "$DIR" --clobber
+              mine release upload "$tag" "$DIR/$a" --clobber
+              rm -f "$DIR/$a"
+            done
+          done
+
+      # 镜像必然覆盖 fork 默认分支 windows——把 workflow 文件放回并提交推送
+      #（否则 windows 被镜像后文件消失，定时任务会"自杀"）
+      # 注意：上游没有 .github 目录，checkout 后它不存在，必须先 mkdir（AnyPS5
+      # 上游自带 workflows 目录所以没踩过这个坑）
+      - name: Put this workflow back on windows
+        run: |
+          git checkout -f -B windows upstream/windows
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/sync.yml" .github/workflows/sync-upstream.yml
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "chore: keep fork-sync workflow"
+          git push origin windows
